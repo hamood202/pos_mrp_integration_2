@@ -1,4 +1,4 @@
-from odoo import models, api, _
+from odoo import models, api, fields, _
 from odoo.exceptions import UserError
 
 class PosOrder(models.Model):
@@ -6,80 +6,84 @@ class PosOrder(models.Model):
 
     @api.model_create_multi
     def create(self, vals_list):
+        """
+        Overrides the create method to automatically generate Manufacturing Orders (MO)
+        for products marked for POS manufacturing.
+        """
         orders = super().create(vals_list)
+        
         for order in orders:
-            # التحقق من المنتجات التي تم تفعيل خيار التصنيع لها
+            # 1. Filter order lines for products requiring POS manufacturing
             manufactured_lines = order.lines.filtered(
                 lambda l: l.product_id.product_tmpl_id.pos_manufacture
             )
 
-            products_to_manufacture = {}
+            # 2. Aggregate quantities by product
+            products_to_process = {}
             for line in manufactured_lines:
                 product = line.product_id
-                if product not in products_to_manufacture:
-                    products_to_manufacture[product] = 0.0
-                products_to_manufacture[product] += line.qty
+                products_to_process[product] = products_to_process.get(product, 0.0) + line.qty
 
-            for product, total_qty in products_to_manufacture.items():
-                # في Odoo 17، الدالة تعيد defaultdict، لذا يجب تمرير المنتج كأول وسيط
-                bom_dict = self.env['mrp.bom']._bom_find(product, company_id=order.company_id.id)
-                
-                # استخراج سجل الـ BoM الفعلي من القاموس
-                bom = bom_dict.get(product) if isinstance(bom_dict, dict) else bom_dict
+            # 3. Process each product to create Manufacturing Orders
+            for product, total_qty in products_to_process.items():
+                # Find Bill of Materials (BoM) - Odoo 17 returns a defaultdict
+                bom_data = self.env['mrp.bom']._bom_find(product, company_id=order.company_id.id)
+                bom = bom_data.get(product) if isinstance(bom_data, dict) else bom_data
 
                 if not bom:
                     raise UserError(
-                        _("Cannot sell product '%s' via POS: No Bill of Materials found.")
+                        _("Cannot sell product '%s' via POS: No Bill of Materials found.") 
                         % product.display_name
                     )
 
-                # التحقق من توفر المواد الخام قبل البدء
+                # 4. Raw Material Availability Check
                 for bom_line in bom.bom_line_ids:
                     component = bom_line.product_id
-                    # حساب الكمية المطلوبة بناءً على كمية الـ BoM الأساسية
+                    # Calculate required quantity based on BoM ratio
                     required_qty = (bom_line.product_qty / bom.product_qty) * total_qty
-                    available_qty = component.qty_available
-
-                    if available_qty < required_qty:
+                    
+                    if component.qty_available < required_qty:
                         raise UserError(_(
-                            "Cannot sell '%s'. Required component '%s' is insufficient. Required: %.2f, Available: %.2f"
-                        ) % (
-                            product.display_name,
-                            component.display_name,
-                            required_qty,
-                            available_qty
-                        ))
+                            "Insufficient stock for component '%(comp)s'. "
+                            "Required for '%(prod)s': %(req).2f, Available: %(avail).2f"
+                        ) % {
+                            'comp': component.display_name,
+                            'prod': product.display_name,
+                            'req': required_qty,
+                            'avail': component.qty_available
+                        })
 
-                # إنشاء أمر التصنيع (MO)
-                mo = self.env['mrp.production'].sudo().create({
+                # 5. Create the Manufacturing Order (MO)
+                manufacturing_order = self.env['mrp.production'].sudo().create({
                     'product_id': product.id,
                     'product_qty': total_qty,
                     'product_uom_id': product.uom_id.id,
                     'bom_id': bom.id,
-                    'origin': order.name or order.pos_reference or "POS Order",
+                    'origin': order.name or order.pos_reference,
                     'company_id': order.company_id.id,
                 })
                 
-                # تأكيد الأمر (Confirm) لحجز المواد الخام
-                mo.action_confirm()
+                # 6. Confirm the MO to reserve materials
+                manufacturing_order.action_confirm()
                 
-                # إنهاء الأمر (Mark as Done) كما هو مطلوب في الكود الخاص بك
-                # ملاحظة: button_mark_done في أودو 17 قد تحتاج لإنشاء سجلات الانتاج أولاً
-                # # إذا واجهت مشكلة هنا، اكتفِ بـ action_confirm() ليقوم المخزني بإنهاء العمل يدوياً.
+                # Optional: Automatically mark as done (Uncomment if needed)
                 # try:
-                #     mo.button_mark_done()
+                #     manufacturing_order.button_mark_done()
                 # except Exception:
-                #     # في حال فشل الإغلاق التلقائي (بسبب قيود في النسخة)، يظل الأمر مؤكداً (Confirmed)
                 #     pass
 
         return orders
 
-    
     def open_related_mos(self):
+        """
+        Action for the Smart Button to display MOs linked to this POS Order.
+        """
+        self.ensure_one()
         return {
             'type': 'ir.actions.act_window',
-            'name': 'Manufacturing Orders',
+            'name': _('Related Manufacturing Orders'),
             'res_model': 'mrp.production',
             'view_mode': 'tree,form',
             'domain': [('origin', '=', self.name)],
+            'context': {'default_origin': self.name},
         }
