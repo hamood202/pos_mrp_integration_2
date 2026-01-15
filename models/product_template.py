@@ -11,13 +11,27 @@ class ProductTemplate(models.Model):
 
     @api.constrains('pos_manufacture')
     def _check_bom_exists(self):
+        """
+        Validates that a Bill of Materials (BoM) exists for products marked for POS manufacturing.
+        
+        This constraint ensures data integrity by preventing the user from enabling 
+        the 'Manufacture in POS' feature if the product cannot actually be produced 
+        due to a missing BoM.
+        
+        :raises ValidationError: If 'pos_manufacture' is True but no BoM is linked 
+                                 to the product template or its variants.
+        """
         for template in self:
             if template.pos_manufacture:
-                has_bom = self.env['mrp.bom'].search([
-                    '|', ('product_tmpl_id', '=', template.id),
+                # Search for any BoM linked to this template or its specific variants
+                bom_count = self.env['mrp.bom'].search_count([
+                    '|', 
+                    ('product_tmpl_id', '=', template.id),
                     ('product_id.product_tmpl_id', '=', template.id)
-                ], limit=1)
-                if not has_bom:
+                ])
+                
+                if not bom_count:
                     raise ValidationError(_(
-                        "Product '%s' has 'Manufacture in POS' enabled but no BoM found!"
+                        "Product '%s' has 'Manufacture in POS' enabled, but no Bill of Materials (BoM) "
+                        "was found. Please define a BoM before enabling this feature."
                     ) % template.name)
